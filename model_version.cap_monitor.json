@@ -1,0 +1,21 @@
+{
+  "model_name": "cap_monitor_rf",
+  "model_version": "v1.0",
+  "task": "regression_multioutput",
+  "model_path": "./models/cap_monitor.joblib",
+  "features": [
+    "v_pp",
+    "i_pp",
+    "v_rms",
+    "i_rms",
+    "max_dvdt",
+    "esr_raw",
+    "c_raw"
+  ],
+  "targets": [
+    "capacitance_uF",
+    "esr_ohm"
+  ],
+  "requires_scaler": false,
+  "notes": "小样本+7特征+MultiOutput RF；从文件名解析C/R。"
+}

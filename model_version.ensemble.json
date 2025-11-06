@@ -1,0 +1,30 @@
+{
+  "model_name": "ensemble_model",
+  "model_version": "v1.0-75_25",
+  "features": [
+    "原始有效值",
+    "原始峰值",
+    "原始谷值",
+    "原始峰峰值",
+    "谷值/峰值",
+    "峰峰值/有效值",
+    "峰值与有效值的比值",
+    "谷值与有效值的比值"
+  ],
+  "requires_scaler": false,
+  "model_path": "./models\\ens_model.joblib",
+  "class_order": [
+    "Q1开路",
+    "Q1开路+Q2短路",
+    "Q1短路",
+    "Q1短路+Q3开路",
+    "Q2开路",
+    "Q2短路",
+    "Q3开路",
+    "Q3开路+Q4短路",
+    "Q3短路",
+    "Q4开路",
+    "Q4短路",
+    "正常模式"
+  ]
+}

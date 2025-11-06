@@ -1,0 +1,554 @@
+# -*- coding: utf-8 -*-
+"""
+PFC 故障诊断 — 多算法批量推理与评估/预测（带手动单样本预测）
+- 登录（支持 .streamlit/secrets.toml；默认 admin/pfc@123）
+- 选择并加载模型（RIMER/RF/SVM/LR/Ensemble）
+- 评估（后25行）/ 仅预测（可选后25/前75/前100）
+- 预处理：按8特征去重；3σ过滤（关闭/全局/按类别）
+- 手动输入单样本（4基础量或8特征）→ 预测类别+概率
+- ★ 修复：模型与配置持久化到 st.session_state，避免输入框触发重跑后“模型丢失”
+"""
+import os
+import re
+import io
+import json
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------- 页面配置 ----------
+st.set_page_config(page_title="PFC 故障诊断平台", page_icon="🛠️", layout="wide")
+
+# ---------- 登录与标题 ----------
+USERNAME_DEFAULT = "admin"
+PASSWORD_DEFAULT = "pfc@123"
+HEADER_TITLE = "PFC 故障诊断平台 — 多算法选择推理与评估/预测"
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import (accuracy_score, confusion_matrix, classification_report,
+                             precision_recall_curve, average_precision_score)
+
+plt.rcParams["axes.unicode_minus"] = False
+from matplotlib import font_manager
+def _use_chinese_font(prefer: str | None = None) -> str | None:
+    cands = [prefer] if prefer else []
+    cands += ["Microsoft YaHei","SimHei","PingFang SC","Hiragino Sans GB","Heiti SC",
+              "STHeiti","Songti SC","KaiTi","FangSong","WenQuanYi Micro Hei",
+              "Noto Sans CJK SC","Source Han Sans CN","Arial Unicode MS"]
+    owned = {f.name for f in font_manager.fontManager.ttflist}
+    ch = next((n for n in cands if n in owned), None)
+    if ch:
+        matplotlib.rcParams["font.family"] = [ch]
+        matplotlib.rcParams["font.sans-serif"] = [ch]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return ch
+_ = _use_chinese_font()
+
+# ---------- 与训练脚本一致的常量 ----------
+FINAL_FEATURES = [
+    "原始有效值","原始峰值","原始谷值","原始峰峰值",
+    "谷值/峰值","峰峰值/有效值","峰值与有效值的比值","谷值与有效值的比值"
+]
+BASE_FEATURES = ["原始有效值","原始峰值","原始谷值","原始峰峰值"]
+TRAIN_ROWS, TOTAL_TAKE = 75, 100
+TEST_ROWS = TOTAL_TAKE - TRAIN_ROWS
+
+DEFAULT_VERSION_FILE = {
+    "RIMER":    "model_version.rimer.json",
+    "RF":       "model_version.rf.json",
+    "SVM":      "model_version.svm.json",
+    "LR":       "model_version.lr.json",
+    "Ensemble": "model_version.ensemble.json",
+}
+FILENAME_RULES = [
+    {"pattern": r"normal", "label": "正常模式"},
+    {"pattern": r"Q1[_-]?mode", "label": "Q1开路"},
+    {"pattern": r"Q1[_-]?open.*Q2[_-]?short", "label": "Q1开路+Q2短路"},
+    {"pattern": r"Q1[_-]?short(?!.*Q3[_-]?open)", "label": "Q1短路"},
+    {"pattern": r"Q1[_-]?short.*Q3[_-]?open", "label": "Q1短路+Q3开路"},
+    {"pattern": r"Q2[_-]?mode", "label": "Q2开路"},
+    {"pattern": r"Q2[_-]?short", "label": "Q2短路"},
+    {"pattern": r"Q3[_-]?mode", "label": "Q3开路"},
+    {"pattern": r"Q3[_-]?open.*Q4[_-]?short", "label": "Q3开路+Q4短路"},
+    {"pattern": r"Q3[_-]?short(?!.*Q4[_-]?open)", "label": "Q3短路"},
+    {"pattern": r"Q4[_-]?mode", "label": "Q4开路"},
+    {"pattern": r"Q4[_-]?short", "label": "Q4短路"},
+]
+ALIASES = {
+    "原始有效值": ["原始有效值","处理后有效值","归一化有效值","有效值"],
+    "原始峰值":   ["原始峰值","处理峰值","归一化峰值","峰值"],
+    "原始谷值":   ["原始谷值","处理谷值","归一化谷值","谷值"],
+    "原始峰峰值": ["原始峰峰值","处理峰峰值","归一化峰峰值","峰峰值"],
+}
+
+# ---------- 登录 ----------
+def _safe_rerun():
+    if hasattr(st, "rerun"): st.rerun()
+    else: st.experimental_rerun()
+
+def check_login(user: str, pwd: str) -> bool:
+    try:
+        auth = st.secrets.get("auth", {})
+        username = auth.get("username", USERNAME_DEFAULT)
+        password = auth.get("password", PASSWORD_DEFAULT)
+    except Exception:
+        username, password = USERNAME_DEFAULT, PASSWORD_DEFAULT
+    return (user == username) and (pwd == password)
+
+def _render_header_bar():
+    col1, col2 = st.columns([8,1])
+    with col1:
+        st.markdown(f"<h2 style='text-align:center;margin:0'>{HEADER_TITLE}</h2>", unsafe_allow_html=True)
+    with col2:
+        if st.button("退出登录", use_container_width=True):
+            st.session_state.clear(); _safe_rerun()
+    st.divider()
+
+def login_block() -> bool:
+    if st.session_state.get("authed", False):
+        _render_header_bar(); return True
+    st.title("🔐 登录 PFC 故障诊断平台")
+    with st.form("login"):
+        user = st.text_input("用户名", value="")
+        pwd  = st.text_input("密码", value="", type="password")
+        ok   = st.form_submit_button("登录")
+    if ok:
+        if check_login(user, pwd):
+            st.session_state["authed"] = True
+            st.success("登录成功"); _safe_rerun()
+        else:
+            st.error("用户名或密码错误")
+    st.stop()
+
+# ---------- 通用数据处理 ----------
+def read_csv_fallback(file) -> pd.DataFrame:
+    try:
+        return pd.read_csv(file, encoding="gbk")
+    except Exception:
+        file.seek(0); return pd.read_csv(file, encoding="utf-8")
+
+def _collapse_duplicates_keep_first(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    cols = [c for c in df.columns if c == name]
+    if len(cols) > 1: df = df.drop(columns=cols[1:])
+    return df
+
+def coerce_and_derive_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns=lambda x: str(x).strip())
+    # 别名 -> 标准名
+    rename_map = {}
+    for canon, alts in ALIASES.items():
+        if canon in df.columns: continue
+        for a in alts:
+            if a in df.columns and a != canon:
+                rename_map[a] = canon; break
+    if rename_map: df = df.rename(columns=rename_map)
+    for b in BASE_FEATURES:
+        df = _collapse_duplicates_keep_first(df, b)
+        if b not in df.columns: raise ValueError(f"缺少基础列：{b}")
+    # 派生四个比值
+    if "谷值/峰值" not in df.columns:
+        df["谷值/峰值"] = df["原始谷值"] / (df["原始峰值"] + 1e-8)
+    if "峰峰值/有效值" not in df.columns:
+        df["峰峰值/有效值"] = df["原始峰峰值"] / (df["原始有效值"] + 1e-8)
+    if "峰值与有效值的比值" not in df.columns:
+        df["峰值与有效值的比值"] = df["原始峰值"] / (df["原始有效值"] + 1e-8)
+    if "谷值与有效值的比值" not in df.columns:
+        df["谷值与有效值的比值"] = df["原始谷值"] / (df["原始有效值"] + 1e-8)
+    for n in FINAL_FEATURES:
+        df = _collapse_duplicates_keep_first(df, n)
+    return df
+
+def infer_label_from_name(name: str, rules: list) -> str | None:
+    for r in rules:
+        if re.search(r["pattern"], name, flags=re.I): return r["label"]
+    return None
+
+# ---------- 构建评估/预测集 ----------
+def build_eval_set(uploaded_files, drop_dup: bool, sigma_mode: str, filename_rules):
+    X_list, y_list, used_labels = [], [], []
+    for f in uploaded_files:
+        name = f.name
+        df = read_csv_fallback(f).dropna()
+        df = coerce_and_derive_features(df)
+        if drop_dup:
+            n0 = len(df)
+            df = df.drop_duplicates(subset=FINAL_FEATURES, keep="first")
+            n1 = len(df)
+            if n1 < n0: st.info(f"[{name}] 去重：{n0} → {n1}（移除 {n0-n1} 条）")
+        valid = df[FINAL_FEATURES].dropna().head(TOTAL_TAKE)
+        if len(valid) < TEST_ROWS:
+            st.warning(f"[{name}] 有效样本不足 {TEST_ROWS} 条，已跳过。"); continue
+        test_df = valid.iloc[TRAIN_ROWS:TOTAL_TAKE]
+        label = infer_label_from_name(name, filename_rules)
+        if label is None:
+            st.warning(f"无法从文件名推断标签，已跳过：{name}"); continue
+        X_list.append(test_df.values)
+        y_list.extend([label]*len(test_df))
+        used_labels.append(label)
+    if not X_list:
+        return np.empty((0,len(FINAL_FEATURES))), np.array([],dtype=object), []
+    X_test = np.vstack(X_list); y_test = np.array(y_list, dtype=object)
+
+    if sigma_mode != "none" and len(X_test) > 0:
+        if sigma_mode == "global":
+            n0 = len(X_test)
+            z = np.abs((X_test - X_test.mean(axis=0))/(X_test.std(axis=0)+1e-8))
+            keep = np.all(z < 3, axis=1)
+            X_test, y_test = X_test[keep], y_test[keep]
+            st.info(f"全局 3σ 过滤：{n0} → {len(X_test)}（移除 {n0-len(X_test)} 条）")
+        elif sigma_mode == "per_class":
+            n0 = len(X_test)
+            keep_idx = np.ones(len(y_test), dtype=bool)
+            for c in np.unique(y_test):
+                mask = (y_test == c); Xc = X_test[mask]
+                if len(Xc) == 0: continue
+                z = np.abs((Xc - Xc.mean(axis=0))/(Xc.std(axis=0)+1e-8))
+                keep_idx[mask] = np.all(z < 3, axis=1)
+            X_test, y_test = X_test[keep_idx], y_test[keep_idx]
+            st.info(f"按类别 3σ 过滤：{n0} → {len(X_test)}（移除 {n0-len(X_test)} 条）")
+
+    classes = sorted(list(set(used_labels)))
+    return X_test, y_test, classes
+
+def build_predict_subset(df: pd.DataFrame, range_key: str) -> pd.DataFrame:
+    valid = df[FINAL_FEATURES].dropna().head(TOTAL_TAKE)
+    if range_key == "rear25": return valid.iloc[TRAIN_ROWS:TOTAL_TAKE]
+    if range_key == "front75": return valid.iloc[:TRAIN_ROWS]
+    return valid.iloc[:TOTAL_TAKE]
+
+# ---------- 模型加载 & 会话持久化 ----------
+def load_version_json(path: str):
+    with open(path, "r", encoding="utf-8") as f: return json.load(f)
+
+def _really_load_model(version_path: str):
+    info = load_version_json(version_path)
+    mdl_rel = info.get("model_path")
+    model_path = mdl_rel if os.path.isabs(mdl_rel) else os.path.join(os.path.dirname(os.path.abspath(__file__)), mdl_rel)
+    try:
+        if "rimer" in os.path.basename(model_path).lower():
+            from rimer_model import OptimizedRIMER  # noqa: F401
+    except Exception as e:
+        st.error("加载 RIMER 失败：请确认 rimer_model.py 与 app.py 同目录且可导入；并已安装 tqdm"); raise e
+    model = joblib.load(model_path)
+    classes = info.get("class_order", [])
+    features = info.get("features", FINAL_FEATURES)
+    return model, classes, features, info
+
+def _store_model_to_state(model, classes, features, info, version_file):
+    st.session_state["mdl_obj"] = model
+    st.session_state["mdl_classes"] = classes
+    st.session_state["mdl_features"] = features
+    st.session_state["mdl_info"] = info
+    st.session_state["mdl_version_file"] = version_file
+
+def _get_model_from_state():
+    return (st.session_state.get("mdl_obj"),
+            st.session_state.get("mdl_classes", []),
+            st.session_state.get("mdl_features", FINAL_FEATURES),
+            st.session_state.get("mdl_info", {}),
+            st.session_state.get("mdl_version_file"))
+
+# ---------- 评分/可视化 ----------
+def _smooth(arr, win: int = 11):
+    n = len(arr)
+    if n < 5: return arr
+    win = max(5, min(win, n if n % 2 == 1 else n - 1))
+    k = np.ones(win)/win
+    pad = np.r_[arr[0], arr, arr[-1]]
+    return np.convolve(pad, k, mode="same")[1:-1]
+
+def _get_pred_and_scores(model, X: np.ndarray, all_classes: list[str]):
+    y_pred = model.predict(X)
+    model_classes = getattr(model, "classes_", None)
+    y_score = None
+    if hasattr(model, "predict_proba"):
+        try: y_score = model.predict_proba(X)
+        except Exception: y_score = None
+    if y_score is None and hasattr(model, "decision_function"):
+        try:
+            df = model.decision_function(X)
+            if df.ndim == 1: df = np.vstack([-df, df]).T
+            df = df - df.max(axis=1, keepdims=True)
+            exp = np.exp(df); y_score = exp/(exp.sum(axis=1, keepdims=True)+1e-8)
+        except Exception: y_score = None
+    if y_score is None:
+        base_classes = list(model_classes) if model_classes is not None else all_classes
+        y_score = np.zeros((len(y_pred), len(base_classes)))
+        idx = {c:i for i,c in enumerate(base_classes)}
+        for i,c in enumerate(y_pred):
+            if c in idx: y_score[i, idx[c]] = 1.0
+        model_classes = base_classes
+    if model_classes is None: model_classes = all_classes
+    model_classes = list(model_classes)
+    aligned = np.zeros((len(y_pred), len(all_classes)))
+    pos = {c:i for i,c in enumerate(model_classes)}
+    for j,c in enumerate(all_classes):
+        if c in pos: aligned[:, j] = y_score[:, pos[c]]
+    return y_pred, aligned
+
+def _plot_pr_curves(y_true, y_score, classes):
+    y_bin = label_binarize(y_true, classes=classes)
+    p_micro, r_micro, _ = precision_recall_curve(y_bin.ravel(), y_score.ravel())
+    ap_micro = average_precision_score(y_bin, y_score, average="micro")
+    fig, ax = plt.subplots(figsize=(7.2,4.6), dpi=140)
+    ax.plot(_smooth(r_micro), _smooth(p_micro), lw=2.2, label=f"micro-avg AP={ap_micro:.3f}")
+    for i,c in enumerate(classes):
+        p, r, _ = precision_recall_curve(y_bin[:, i], y_score[:, i])
+        ax.plot(_smooth(r), _smooth(p), lw=1.2, alpha=0.85, label=str(c))
+    ax.set_xlim([0,1]); ax.set_ylim([0,1.05])
+    ax.set_xlabel("召回率"); ax.set_ylabel("精确率")
+    ax.set_title("PR 曲线（平滑）"); ax.legend(ncol=2, fontsize=8); ax.grid(alpha=0.3, linestyle="--")
+    plt.tight_layout(); return fig
+
+def eval_and_plot(model, X_test, y_test, all_classes):
+    if X_test.size == 0:
+        st.warning("测试集为空，无法评估。"); return
+    y_pred, y_score = _get_pred_and_scores(model, X_test, all_classes)
+    acc = accuracy_score(y_test, y_pred)
+    st.subheader(f"✅ Accuracy：{acc:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred, labels=all_classes)
+    fig, ax = plt.subplots(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Greens',
+                xticklabels=all_classes, yticklabels=all_classes, ax=ax)
+    ax.set_xlabel("预测类别"); ax.set_ylabel("实际类别")
+    ax.set_title(f"混淆矩阵（Accuracy = {acc:.4f}）")
+    ax.set_xticklabels(all_classes, rotation=45, ha='right'); ax.set_yticklabels(all_classes, rotation=0)
+    plt.tight_layout(); st.pyplot(fig)
+
+    rep = classification_report(y_test, y_pred, labels=all_classes, output_dict=True, zero_division=0)
+    rep_df = pd.DataFrame(rep).T
+    st.subheader("分类报告"); st.dataframe(rep_df.style.format(precision=4), use_container_width=True)
+
+    appeared = sorted(list({c for c in y_test if c in all_classes}))
+    if len(appeared) >= 2:
+        col_idx = [all_classes.index(c) for c in appeared]
+        y_score_sub = y_score[:, col_idx]
+        st.subheader("PR 曲线（平滑）"); st.pyplot(_plot_pr_curves(y_test, y_score_sub, appeared))
+    else:
+        st.info("PR 曲线：评估集中出现的有效类别不足 2 个，暂不绘制。")
+
+# ---------- 仅预测模式展示 ----------
+def predict_and_show(model, files, drop_dup, sigma_mode_for_predict, range_key, classes_in_model):
+    if not files:
+        st.warning("请先上传 CSV 文件。"); return
+    all_classes = classes_in_model if classes_in_model else list(getattr(model, "classes_", []))
+
+    for f in files:
+        name = f.name
+        df = read_csv_fallback(f).dropna()
+        df = coerce_and_derive_features(df)
+        if drop_dup:
+            n0 = len(df)
+            df = df.drop_duplicates(subset=FINAL_FEATURES, keep="first")
+            n1 = len(df)
+            if n1 < n0: st.info(f"[{name}] 去重：{n0} → {n1}（移除 {n0-n1} 条）")
+        subset = build_predict_subset(df, range_key)
+        if len(subset) == 0:
+            st.warning(f"[{name}] 无可用样本，已跳过。"); continue
+
+        X = subset.values
+        if sigma_mode_for_predict == "global":
+            n0 = len(X)
+            z = np.abs((X - X.mean(axis=0))/(X.std(axis=0)+1e-8))
+            keep = np.all(z < 3, axis=1)
+            X = X[keep]; st.info(f"[{name}] 全局 3σ 过滤：{n0} → {len(X)}（移除 {n0-len(X)} 条）")
+
+        y_pred, y_score = _get_pred_and_scores(model, X, all_classes)
+        max_score = y_score.max(axis=1) if y_score is not None and y_score.size else np.full(len(y_pred), np.nan)
+
+        st.subheader(f"📄 文件：{name}（样本 {len(X)}）")
+        counts = pd.Series(y_pred).value_counts().sort_values(ascending=False)
+        maj_label = counts.index[0] if len(counts) else "N/A"
+        mean_conf = float(np.nanmean(max_score)) if len(max_score) else float("nan")
+        c1, c2 = st.columns(2)
+        with c1: st.metric("多数类（Majority）", str(maj_label))
+        with c2: st.metric("平均最大置信度", f"{mean_conf:.3f}" if not np.isnan(mean_conf) else "N/A")
+
+        fig, ax = plt.subplots(figsize=(6.5,3.6), dpi=140)
+        counts.plot(kind="bar", ax=ax, color="#4CAF50")
+        ax.set_ylabel("计数"); ax.set_title("预测类别分布")
+        plt.xticks(rotation=45, ha="right"); plt.tight_layout()
+        st.pyplot(fig)
+
+        out_df = pd.DataFrame({
+            "file": name, "row_index": subset.index.values,
+            "pred": y_pred, "max_confidence": max_score
+        })
+        st.dataframe(out_df.head(1000), use_container_width=True)
+        buf = io.StringIO(); out_df.to_csv(buf, index=False, encoding="utf-8-sig")
+        st.download_button(
+            label=f"⬇️ 下载预测结果（{name}.csv）",
+            data=buf.getvalue().encode("utf-8-sig"),
+            file_name=f"pred_{os.path.splitext(name)[0]}.csv",
+            mime="text/csv"
+        )
+
+# ---------- 手动输入单样本预测 ----------
+def _build_single_row_from_inputs(mode_key: str, feature_order: list[str]) -> pd.DataFrame:
+    if mode_key == "base4":
+        col1, col2 = st.columns(2)
+        with col1:
+            v_rms = st.number_input("原始有效值", value=0.0, format="%.6f")
+            v_min = st.number_input("原始谷值", value=0.0, format="%.6f")
+        with col2:
+            v_max = st.number_input("原始峰值", value=0.0, format="%.6f")
+            v_pp  = st.number_input("原始峰峰值", value=0.0, format="%.6f")
+        df = pd.DataFrame([{
+            "原始有效值": v_rms, "原始峰值": v_max, "原始谷值": v_min, "原始峰峰值": v_pp
+        }])
+        df["谷值/峰值"] = df["原始谷值"] / (df["原始峰值"] + 1e-8)
+        df["峰峰值/有效值"] = df["原始峰峰值"] / (df["原始有效值"] + 1e-8)
+        df["峰值与有效值的比值"] = df["原始峰值"] / (df["原始有效值"] + 1e-8)
+        df["谷值与有效值的比值"] = df["原始谷值"] / (df["原始有效值"] + 1e-8)
+    else:
+        vals = {}
+        for name in FINAL_FEATURES:
+            vals[name] = st.number_input(name, value=0.0, format="%.6f", key=f"in8_{name}")
+        df = pd.DataFrame([vals])
+    return df.reindex(columns=feature_order)
+
+def single_predict_ui():
+    st.subheader("③ 手动输入单样本预测")
+    # 从会话取模型
+    model, mdl_classes, mdl_features, _, _ = _get_model_from_state()
+    if model is None:
+        st.info("请先在上方“① 加载模型”处加载模型。"); return
+    all_classes = mdl_classes if mdl_classes else list(getattr(model, "classes_", []))
+
+    with st.expander("手动输入并预测", expanded=False):
+        mode_key = st.radio(
+            "输入方式",
+            options=["base4","final8"], index=0,
+            format_func=lambda x: "只填 4 个基础量（自动派生 4 个比值）" if x=="base4" else "直接填 8 个最终特征"
+        )
+        df_one = _build_single_row_from_inputs(mode_key, mdl_features)
+
+        if st.button("单样本预测", type="primary"):
+            try:
+                X = df_one.values.astype(float)
+                y_pred, y_score = _get_pred_and_scores(model, X, all_classes)
+                pred = y_pred[0]
+                st.success(f"预测结果：**{pred}**")
+                if all_classes and y_score is not None and y_score.size:
+                    prob = pd.Series(y_score[0], index=all_classes).sort_values(ascending=False)
+                    st.dataframe(prob.to_frame("概率").style.format("{:.3f}"), use_container_width=True)
+                    fig, ax = plt.subplots(figsize=(6.2,3.6), dpi=140)
+                    prob.plot(kind="bar", ax=ax, color="#4CAF50")
+                    ax.set_ylabel("概率"); ax.set_title("各类别概率")
+                    plt.xticks(rotation=45, ha="right"); plt.tight_layout()
+                    st.pyplot(fig)
+            except Exception as e:
+                st.error(f"预测失败：{e}")
+
+# ---------- 主体 ----------
+def main():
+    if not login_block(): return
+
+    # 侧边栏：算法 / 版本文件
+    st.sidebar.header("算法 / 模型")
+    algo = st.sidebar.selectbox("选择算法 / 模型", list(DEFAULT_VERSION_FILE.keys()), index=0)
+    custom_ver = st.sidebar.text_input("或自定义 model_version.json 路径（留空则使用上方选择）", "")
+
+    # 读取 class_mapping.json（可覆盖默认文件名 → 标签规则）
+    filename_rules = FILENAME_RULES
+    if os.path.exists("class_mapping.json"):
+        try:
+            with open("class_mapping.json","r",encoding="utf-8") as f:
+                cm = json.load(f)
+            filename_rules = cm.get("filename_rules", filename_rules)
+        except Exception:
+            pass
+
+    # 预处理与运行模式
+    with st.expander("数据预处理选项", expanded=False):
+        drop_dup = st.checkbox("单文件样本去重（按 8 个特征 drop_duplicates）", value=False)
+        sigma_mode = st.radio(
+            "3σ 异常值过滤",
+            options=["none","global","per_class"], index=0,
+            format_func=lambda x: {"none":"关闭","global":"全局 3σ","per_class":"按类别 3σ"}[x]
+        )
+        mode = st.radio(
+            "运行模式", options=["eval","predict"], index=0,
+            format_func=lambda x: "评估（需要标签）" if x=="eval" else "仅预测（不需要标签）"
+        )
+        if mode == "predict":
+            range_key = st.selectbox(
+                "仅预测模式：取样范围",
+                options=[("rear25","后25行（76-100）"),("front75","前75行（1-75）"),("all100","前100行（1-100）")],
+                index=0, format_func=lambda t: t[1]
+            )[0]
+        else:
+            range_key = "rear25"
+
+    # ① 加载模型（支持会话持久化）
+    st.subheader("① 加载模型")
+    version_file = custom_ver.strip() if custom_ver.strip() else DEFAULT_VERSION_FILE[algo]
+    if not os.path.isabs(version_file):
+        version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), version_file)
+
+    # 显示当前状态
+    cur_model, cur_classes, cur_features, cur_info, cur_ver = _get_model_from_state()
+    if cur_model is not None:
+        with st.status("当前模型：已加载 ✅", expanded=False):
+            st.write("version_file:", cur_ver)
+            st.write("model_name:", cur_info.get("model_name", ""))
+            st.write("features:", cur_features)
+            if cur_classes: st.write("class_order:", cur_classes)
+
+    colL, colR = st.columns([1,1])
+    with colL:
+        if st.button("加载/刷新模型", type="primary"):
+            if not os.path.exists(version_file):
+                st.error(f"版本文件不存在：{version_file}")
+            else:
+                with st.spinner("加载模型中..."):
+                    model, classes, features, info = _really_load_model(version_file)
+                    _store_model_to_state(model, classes, features, info, version_file)
+                    st.success(f"模型已加载：{os.path.basename(version_file)}")
+    with colR:
+        if st.button("清除已加载模型"):
+            for k in ["mdl_obj","mdl_classes","mdl_features","mdl_info","mdl_version_file"]:
+                st.session_state.pop(k, None)
+            st.info("已清除模型。")
+
+    # ② 上传 CSV 并运行
+    st.subheader("② 上传 CSV（可多选）")
+    files = st.file_uploader("上传 CSV 文件（多选）", type=["csv"], accept_multiple_files=True)
+
+    if st.button("开始运行", type="secondary"):
+        model, classes_in_model, features_in_model, info_json, _ = _get_model_from_state()
+        if model is None:
+            st.error("未能加载模型，请先点击“加载/刷新模型”。"); st.stop()
+        if not files:
+            st.warning("请先上传 CSV 文件。"); st.stop()
+
+        if mode == "eval":
+            with st.spinner("构建评估集并推理..."):
+                X_test, y_test, classes_used = build_eval_set(files, drop_dup, sigma_mode, filename_rules)
+                all_classes = classes_in_model if len(classes_in_model)>0 else sorted(list(set(classes_used)))
+                st.write(f"测试样本数：{len(y_test)}；类别数：{len(all_classes)}")
+                if len(y_test) == 0:
+                    st.warning("没有可评估的样本，请检查上传文件与文件名映射是否正确。")
+                else:
+                    eval_and_plot(model, X_test, y_test, all_classes)
+        else:
+            sigma_predict = "global" if sigma_mode == "global" else "none"
+            if sigma_mode == "per_class":
+                st.info("仅预测模式无法按类别过滤，已自动忽略该选项。")
+            with st.spinner("执行仅预测..."):
+                predict_and_show(model, files, drop_dup, sigma_predict, range_key, classes_in_model)
+
+    # ③ 手动输入单样本预测（使用会话中的模型）
+    single_predict_ui()
+
+    st.caption("提示：模型与特征选择/标准化已封装在训练导出的 pipeline 中；本页所有推理均与训练保持一致。")
+
+if __name__ == "__main__":
+    main()
